@@ -10,7 +10,7 @@ This toolkit takes a different approach:
 
 1. **`btc_data_downloader.py`** — Pulls 5 years of historical daily data for all three variables from free APIs, merges them on date, and outputs clean CSV and Excel files for model calibration.
 
-2. **`monte_carlo_mining.py`** _(coming soon)_ — Runs Monte Carlo simulation over the mining P&L model, using historical distribution parameters (mean, volatility, correlation, halving regime shifts) to generate probability distributions for IRR, payback period, and cumulative cashflow.
+2. **`monte_carlo_mining.py`** — Runs 10,000-path Monte Carlo simulation over the mining P&L model, using historically calibrated distribution parameters (mean, volatility, correlation, halving regime shifts) to generate probability distributions for IRR, MOIC, payback period, and cumulative cashflow. Outputs a professionally formatted "MC Simulation" sheet into a copy of the consolidated financial model.
 
 ## Why Monte Carlo instead of straight-line assumptions
 
@@ -32,8 +32,36 @@ Monte Carlo simulation respects this reality. Instead of one assumed path, it ge
 
 ```
 Python 3.9+
-pip install requests openpyxl pandas numpy
+pip install requests openpyxl pandas numpy scipy
 ```
+
+### Monte Carlo simulation
+
+```bash
+python monte_carlo_mining.py                          # defaults: 10k sims, 60 months
+python monte_carlo_mining.py --simulations 50000      # more paths for tighter confidence
+python monte_carlo_mining.py --months 36              # shorter horizon
+python monte_carlo_mining.py --output-dir ./results   # custom output directory
+```
+
+**Arguments:**
+
+| Flag            | Default                     | Description                           |
+| --------------- | --------------------------- | ------------------------------------- |
+| `--simulations` | 10,000                      | Number of Monte Carlo paths           |
+| `--months`      | 60                          | Projection horizon in months          |
+| `--data-path`   | `data/btc_merged_data.xlsx` | Historical data file                  |
+| `--model-path`  | `Consolidated Model.xlsx`   | Source financial model (not modified) |
+| `--output-dir`  | `output`                    | Where to write the output workbook    |
+
+**Output:** Copies the consolidated model to `output/Consolidated_Model.xlsx` and adds an "MC Simulation" sheet containing:
+
+- Calibration parameters (regime-specific means, std devs, correlations)
+- Summary statistics table (P10/P25/P50/P75/P90 for IRR, MOIC, payback, net income)
+- Probability thresholds (IRR > 0%/10%/20%, payback within 24/36/48 months)
+- Month-by-month cumulative free cashflow percentile curves
+- IRR distribution histogram
+- 20 sample simulation paths with full monthly detail
 
 ### Data downloader
 
@@ -91,10 +119,13 @@ The financial model evaluates two revenue approaches:
 
 ```
 btc-mining-analytics/
-├── btc_data_downloader.py     # Historical data pipeline
-├── monte_carlo_mining.py      # Monte Carlo simulation (coming soon)
-├── data/                      # Sample/cached data
-├── output/                    # Generated files (gitignored)
+├── btc_data_downloader.py                # Historical data pipeline
+├── monte_carlo_mining.py                 # Monte Carlo simulation engine
+├── AGM Consolidated Model AA_2.0.xlsx    # Source financial model (do not modify)
+├── data/
+│   └── btc_merged_data.xlsx              # Historical BTC price + difficulty + hashprice
+├── output/
+│   └── AGM_Consolidated_Model_AA_2_0.xlsx  # Output model with MC Simulation sheet
 ├── requirements.txt
 ├── .gitignore
 └── README.md
@@ -102,23 +133,69 @@ btc-mining-analytics/
 
 ## Methodology notes
 
-### On the choice of log-returns
+### Calibration approach
 
-The Monte Carlo simulation uses log-returns (ln(P*t / P*{t-1})) rather than simple percentage returns for calibration. Log-returns are additive across time periods, better approximate normality for financial data, and prevent the mathematical impossibility of prices going negative during simulation. This is standard practice in quantitative finance.
+The simulation is calibrated from the **post-halving rally phase** (April 2024 – March 2025), which reflects the structural regime shift driven by spot Bitcoin ETF approvals and institutional adoption. The Q4-2025/Q1-2026 drawdown is excluded from calibration as it was driven by macro factors (tariff escalation, rate-hike cycle) rather than any change in Bitcoin's structural fundamentals.
+
+**Calibrated parameters:**
+
+| Regime                      | Price Drift          | Price Vol | Diff Drift           | Diff Vol | Correlation |
+| --------------------------- | -------------------- | --------- | -------------------- | -------- | ----------- |
+| Months 1–24 (pre-halving)   | +1.9%/mo (+25.6%/yr) | 10.3%/mo  | +2.6%/mo (+37.0%/yr) | 3.8%/mo  | 0.53        |
+| Months 25–60 (post-halving) | +1.9%/mo (+25.6%/yr) | 10.3%/mo  | +1.3%/mo (+17.0%/yr) | 3.8%/mo  | 0.37        |
+
+Post-halving difficulty growth is reduced by 50% to reflect miner capitulation when block rewards halve to 1.5625 BTC with already-compressed margins. A one-time -10% difficulty shock is applied at the halving month (April 2028), calibrated from the observed -5.1% peak-to-trough drop after the April 2024 halving, with a premium for thinner margins in 2028.
+
+### On log-returns
+
+The simulation uses log-returns (ln(P*t / P*{t-1})) rather than simple percentage returns. Log-returns are additive across time periods, better approximate normality for financial data, and prevent prices from going negative during simulation. This is standard practice in quantitative finance.
 
 ### On correlation modelling
 
 BTC price and network difficulty are positively correlated — higher prices attract more mining investment, which increases difficulty. The simulation uses Cholesky decomposition to generate correlated random draws, preserving this relationship. Simulating them independently would produce unrealistic paths (e.g., price crashes while difficulty surges).
 
-### On halving treatment
+### On the halving event
 
-The April 2028 halving is modelled as a structural break, not a smooth transition:
+The April 2028 halving is modelled as a structural break:
 
 - Block reward drops instantaneously from 3.125 to 1.5625 BTC
-- Difficulty growth parameters shift (historically, difficulty growth decelerates post-halving as marginal miners shut down)
-- BTC price growth parameters shift (post-halving periods have historically seen stronger price appreciation)
+- A one-time -10% difficulty shock (marginal miners exit)
+- Difficulty growth rate shifts to a lower post-halving regime
+- Price drift continues unchanged (halving supply squeeze supports price)
 
-The pre-halving and post-halving distribution parameters are calibrated separately from historical data.
+### Operational shutdown floor
+
+The simulation applies an operational shutdown option: if monthly EBITDA drops below zero (net revenue doesn't cover PPA + O&M costs), the mine idles for that month. This means:
+
+- No revenue, no variable costs, and FCF = $0 for that month
+- The mine resumes automatically when conditions improve
+- This prevents unrealistic cash hemorrhaging in downside scenarios
+- Cumulative free cashflow is monotonically non-decreasing (it either grows or stays flat)
+
+This reflects real operational practice — no rational operator runs machines at a loss when they can simply power down and wait.
+
+### IRR computation
+
+IRR is computed as the annualized internal rate of return on monthly free cashflows using bisection root-finding on the NPV function. For simulations where the investment never breaks even (no sign change in the cashflow series), IRR is assigned -100% (total loss). MOIC is computed as total positive cashflows divided by initial capex.
+
+## Key results (10,000 simulations, seed 42)
+
+| Metric            | P10    | P25    | P50      | P75   | P90   |
+| ----------------- | ------ | ------ | -------- | ----- | ----- |
+| IRR               | -99.9% | -88.4% | -39.1%   | 11.5% | 54.3% |
+| MOIC              | 0.06x  | 0.18x  | 0.50x    | 1.21x | 2.46x |
+| Payback month     | 16     | 18     | 23       | 43    | 53    |
+| Year-1 net income | —      | —      | $278,945 | —     | —     |
+| 5-year net income | —      | —      | $630,363 | —     | —     |
+
+| Probability threshold          | Value |
+| ------------------------------ | ----- |
+| Prob. IRR > 0%                 | 30.6% |
+| Prob. IRR > 10%                | 25.6% |
+| Prob. IRR > 20%                | 21.2% |
+| Prob. payback within 24 months | 18.3% |
+| Prob. payback within 48 months | 25.3% |
+| Prob. losing money (5-yr)      | 69.4% |
 
 ## License
 
